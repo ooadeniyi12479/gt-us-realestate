@@ -264,12 +264,17 @@ class OutreachIn(BaseModel):
     property_id:Optional[str]=None; contact_id:Optional[int]=None; channel:str="email"
     recipient:str; subject:str=""; body:str; consent_confirmed:bool=False; suppressed:bool=False
 
+ACQUISITION_STAGES=["Research Owner","Attempt Contact","Contacted","Negotiating","Offer Sent","Under Contract","Closed","Lost"]
+
+class CampaignStageIn(BaseModel):
+    stage:str
+
 class DealRoomIn(BaseModel):
     property_id:str; name:str=""; stage:str="underwriting"; purchase_price:float=0
     projected_value:float=0; invested_capital:float=0; target_close:Optional[datetime]=None
     checklist:list=[]; documents:list=[]; notes:str=""
 
-app=FastAPI(title="GTEXT Real Estate Assistant API",version="4.0.0")
+app=FastAPI(title="GTEXT Real Estate Assistant API",version="4.1.0")
 app.add_middleware(CORSMiddleware,allow_origins=os.getenv("CORS_ORIGINS","http://localhost:8080,http://localhost:5173").split(","),allow_credentials=True,allow_methods=["*"],allow_headers=["*"])
 
 def password_hash(password,salt): return hashlib.pbkdf2_hmac("sha256",password.encode(),bytes.fromhex(salt),200_000).hex()
@@ -403,7 +408,7 @@ def health():
     with Session(engine) as s:
         total=s.scalar(select(func.count(Property.id))) if False else None
         workbook_count=len(s.scalars(select(Property.id).where(Property.source=="GTEXT Workbook")).all())
-    return {"ok":True,"version":"4.0.0","refresh_hours":REFRESH_HOURS,"auth_required":AUTH_REQUIRED,"workbook_properties":workbook_count,"providers":{"rentcast":bool(RENTCAST_API_KEY),"offmarket":bool(OFFMARKET_API_URL and OFFMARKET_API_TOKEN)}}
+    return {"ok":True,"version":"4.1.0","refresh_hours":REFRESH_HOURS,"auth_required":AUTH_REQUIRED,"workbook_properties":workbook_count,"providers":{"rentcast":bool(RENTCAST_API_KEY),"offmarket":bool(OFFMARKET_API_URL and OFFMARKET_API_TOKEN)}}
 
 @app.post("/auth/register")
 def register(data:RegisterIn):
@@ -657,6 +662,137 @@ def underwriting_history(property_id:str):
         rows=s.scalars(select(Underwriting).where(Underwriting.property_id==property_id).order_by(Underwriting.created_at.desc()).limit(20)).all()
         return [{"id":r.id,"strategy":r.strategy,"results":r.results,"created_at":r.created_at.isoformat()} for r in rows]
 
+def build_loi_text(p,offer_price,buyer="GTEXT Investor",recipient="Property Owner"):
+    return f"""LETTER OF INTENT — NON-BINDING
+
+Property: {p.address}, {p.city}, {p.state} {p.zip}
+To: {recipient}
+
+{buyer} is interested in acquiring the property for {offer_price:,.0f} USD, subject to satisfactory due diligence, clear and marketable title, mutually acceptable purchase documentation, and any required financing approval.
+
+Proposed terms:
+- Purchase price: {offer_price:,.0f} USD
+- Earnest money: 1,000 USD
+- Financing: Cash
+- Inspection period: 7 days
+- Target closing: 21 days after executed contract
+
+This letter is for discussion purposes only and is not intended to create a binding purchase agreement or legal obligation."""
+
+def campaign_messages(p,offer_price):
+    subject=f"Property inquiry — {p.address}"
+    email_body=f"""Hello,
+
+I am reaching out regarding the property at {p.address}, {p.city}, {p.state} {p.zip}. We are evaluating a possible direct purchase and, subject to due diligence, would be prepared to discuss an initial offer around {offer_price:,.0f} USD.
+
+If you are the owner or authorized representative and are open to a conversation, please let us know a convenient time to connect.
+
+Thank you,
+GTEXT Acquisition Team"""
+    sms_body=f"GTEXT Acquisition Team: We are interested in discussing {p.address}. Subject to due diligence, our current target is about {offer_price:,.0f} USD. Reply only if you are the owner/authorized representative and wish to discuss."
+    return subject,email_body,sms_body
+
+def bootstrap_acquisition_campaign():
+    created={"contacts":0,"offers":0,"outreach":0}
+    with Session(engine) as s:
+        leads=s.scalars(select(Property).where(Property.lead_status=="active",Property.pipeline_stage=="owner-contact").order_by(Property.id)).all()
+        for p in leads:
+            contact=s.scalar(select(Contact).where(Contact.property_id==p.id,Contact.source=="GTEXT acquisition campaign"))
+            if not contact:
+                contact=Contact(
+                    property_id=p.id,
+                    contact_type="seller",
+                    name=p.owner_name or "Owner Research Required",
+                    email=p.owner_email or "",
+                    phone=p.owner_phone or "",
+                    status="Research Owner",
+                    source="GTEXT acquisition campaign",
+                    notes="Research legal owner and validate seller authority before outreach. Do not infer or invent owner identity.",
+                    updated_at=utcnow()
+                )
+                s.add(contact); s.flush(); created["contacts"]+=1
+
+            offer=s.scalar(select(Offer).where(Offer.property_id==p.id,Offer.status=="draft",Offer.offer_price==p.offer_target))
+            if not offer:
+                recipient=p.owner_name or "Property Owner"
+                offer=Offer(
+                    property_id=p.id,
+                    investor_id=None,
+                    offer_price=p.offer_target,
+                    earnest_money=1000,
+                    close_days=21,
+                    inspection_days=7,
+                    financing="Cash",
+                    status="draft",
+                    recipient_name=recipient,
+                    letter=build_loi_text(p,p.offer_target,recipient=recipient),
+                    created_at=utcnow()
+                )
+                s.add(offer); created["offers"]+=1
+
+            subject,email_body,sms_body=campaign_messages(p,p.offer_target)
+            existing_channels=set(s.scalars(select(Outreach.channel).where(Outreach.property_id==p.id,Outreach.contact_id==contact.id)).all())
+            if "email" not in existing_channels:
+                s.add(Outreach(property_id=p.id,contact_id=contact.id,channel="email",recipient=contact.email or "",subject=subject,body=email_body,status="awaiting-contact-data" if not contact.email else "draft",consent_confirmed=False,suppressed=False,created_at=utcnow()))
+                created["outreach"]+=1
+            if "sms" not in existing_channels:
+                s.add(Outreach(property_id=p.id,contact_id=contact.id,channel="sms",recipient=contact.phone or "",subject="",body=sms_body,status="awaiting-contact-data" if not contact.phone else "draft",consent_confirmed=False,suppressed=False,created_at=utcnow()))
+                created["outreach"]+=1
+        s.commit()
+    return created
+
+bootstrap_acquisition_campaign()
+
+@app.post("/campaign/acquisition/bootstrap")
+def campaign_bootstrap():
+    return {"ok":True,**bootstrap_acquisition_campaign()}
+
+@app.get("/campaign/acquisition")
+def campaign_acquisition():
+    with Session(engine) as s:
+        c=cfg(s)
+        leads=s.scalars(select(Property).where(Property.lead_status=="active").order_by(Property.id)).all()
+        out=[]
+        for p in leads:
+            contact=s.scalar(select(Contact).where(Contact.property_id==p.id,Contact.source=="GTEXT acquisition campaign").order_by(Contact.id.desc()))
+            offer=s.scalar(select(Offer).where(Offer.property_id==p.id).order_by(Offer.created_at.desc()))
+            messages=s.scalars(select(Outreach).where(Outreach.property_id==p.id).order_by(Outreach.created_at.asc())).all()
+            out.append({
+                "property":prop_json(p,c),
+                "contact":{"id":contact.id,"name":contact.name,"email":contact.email,"phone":contact.phone,"stage":contact.status,"notes":contact.notes} if contact else None,
+                "offer":{"id":offer.id,"price":offer.offer_price,"status":offer.status,"letter":offer.letter} if offer else None,
+                "outreach":[{"id":m.id,"channel":m.channel,"recipient":m.recipient,"status":m.status,"consent_confirmed":m.consent_confirmed} for m in messages],
+                "provider_readiness":{"email":bool(SMTP_HOST),"sms":bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_FROM)}
+            })
+        return {"stages":ACQUISITION_STAGES,"count":len(out),"leads":out}
+
+@app.patch("/campaign/acquisition/{property_id}/stage")
+def campaign_stage(property_id:str,data:CampaignStageIn):
+    if data.stage not in ACQUISITION_STAGES: raise HTTPException(400,"Invalid acquisition stage")
+    with Session(engine) as s:
+        p=s.get(Property,property_id)
+        if not p: raise HTTPException(404,"Property not found")
+        contact=s.scalar(select(Contact).where(Contact.property_id==property_id,Contact.source=="GTEXT acquisition campaign").order_by(Contact.id.desc()))
+        if not contact: raise HTTPException(404,"Campaign contact not found")
+        contact.status=data.stage; contact.updated_at=utcnow()
+        stage_map={
+            "Research Owner":"owner-contact",
+            "Attempt Contact":"attempt-contact",
+            "Contacted":"contacted",
+            "Negotiating":"negotiating",
+            "Offer Sent":"offer-sent",
+            "Under Contract":"under-contract",
+            "Closed":"closed",
+            "Lost":"lost"
+        }
+        p.pipeline_stage=stage_map[data.stage]
+        p.lead_status="under-contract" if data.stage=="Under Contract" else "closed" if data.stage in {"Closed","Lost"} else "active"
+        if data.stage=="Offer Sent":
+            offer=s.scalar(select(Offer).where(Offer.property_id==property_id).order_by(Offer.created_at.desc()))
+            if offer and offer.status=="draft": offer.status="sent"
+        s.commit()
+        return {"ok":True,"property_id":property_id,"stage":data.stage,"lead_status":p.lead_status,"pipeline_stage":p.pipeline_stage}
+
 @app.post("/crm/contacts")
 def create_contact(data:ContactIn):
     with Session(engine) as s:
@@ -680,21 +816,7 @@ def offer_create(property_id:str,data:OfferIn,request:Request):
         p=s.get(Property,property_id)
         if not p: raise HTTPException(404,"Property not found")
         inv=s.get(Investor,iid(request)) if iid(request) else None; buyer=(inv.company or inv.name) if inv else "GTEXT Investor"; recipient=data.recipient_name or p.owner_name or p.agent_name or "Property Owner / Listing Representative"
-        letter=f"""LETTER OF INTENT — NON-BINDING
-
-Property: {p.address}, {p.city}, {p.state} {p.zip}
-To: {recipient}
-
-{buyer} is interested in acquiring the property for {data.offer_price:,.0f} USD, subject to satisfactory due diligence, clear and marketable title, mutually acceptable purchase documentation, and any required financing approval.
-
-Proposed terms:
-- Purchase price: {data.offer_price:,.0f} USD
-- Earnest money: {data.earnest_money:,.0f} USD
-- Financing: {data.financing}
-- Inspection period: {data.inspection_days} days
-- Target closing: {data.close_days} days after executed contract
-
-This letter is for discussion purposes only and is not intended to create a binding purchase agreement or legal obligation."""
+        letter=build_loi_text(p,data.offer_price,buyer=buyer,recipient=recipient)
         r=Offer(property_id=property_id,investor_id=iid(request),offer_price=data.offer_price,earnest_money=data.earnest_money,close_days=data.close_days,inspection_days=data.inspection_days,financing=data.financing,status="draft",recipient_name=recipient,letter=letter); s.add(r); s.commit(); s.refresh(r); return {"id":r.id,"status":r.status,"letter":r.letter}
 
 @app.get("/offers")
@@ -740,6 +862,7 @@ def outreach_send(message_id:int):
         r=s.get(Outreach,message_id)
         if not r: raise HTTPException(404,"Message not found")
         if r.suppressed: raise HTTPException(400,"Recipient is suppressed")
+        if not r.recipient: raise HTTPException(400,"Recipient contact data is missing")
         if not r.consent_confirmed: raise HTTPException(400,"Consent or permission has not been confirmed")
         delivered=send_email(r.recipient,r.subject or "Property inquiry",r.body) if r.channel=="email" else send_sms(r.recipient,r.body) if r.channel=="sms" else False
         if not delivered: raise HTTPException(503,"Delivery provider is not configured")
@@ -838,7 +961,7 @@ def dashboard():
     with Session(engine) as s:
         c=cfg(s); rows=s.scalars(select(Property)).all()
         active=[p for p in rows if p.status=="active"]
-        return {"active":len(active),"qualified":sum(1 for p in active if analysis(p,c)["qualified"]),"off_market":sum(1 for p in active if p.market_type=="off-market"),"saved":sum(1 for p in rows if p.saved)}
+        return {"active":len(active),"qualified":sum(1 for p in rows if analysis(p,c)["qualified"]),"off_market":sum(1 for p in rows if p.market_type=="off-market"),"active_acquisition_leads":sum(1 for p in rows if p.lead_status=="active"),"saved":sum(1 for p in rows if p.saved)}
 
 @app.get("/providers")
 def providers():
