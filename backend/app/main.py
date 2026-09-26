@@ -36,6 +36,8 @@ SMTP_TLS=os.getenv("SMTP_TLS","true").lower()=="true"
 TWILIO_ACCOUNT_SID=os.getenv("TWILIO_ACCOUNT_SID","")
 TWILIO_AUTH_TOKEN=os.getenv("TWILIO_AUTH_TOKEN","")
 TWILIO_FROM=os.getenv("TWILIO_FROM","")
+BATCHDATA_API_KEY=os.getenv("BATCHDATA_API_KEY","")
+BATCHDATA_BASE_URL=os.getenv("BATCHDATA_BASE_URL","https://api.batchdata.com/api/v1")
 
 engine=create_engine(DATABASE_URL,connect_args={"check_same_thread":False} if DATABASE_URL.startswith("sqlite") else {})
 
@@ -274,7 +276,7 @@ class DealRoomIn(BaseModel):
     projected_value:float=0; invested_capital:float=0; target_close:Optional[datetime]=None
     checklist:list=[]; documents:list=[]; notes:str=""
 
-app=FastAPI(title="GTEXT Real Estate Assistant API",version="4.1.0")
+app=FastAPI(title="GTEXT Real Estate Assistant API",version="4.2.0")
 app.add_middleware(CORSMiddleware,allow_origins=os.getenv("CORS_ORIGINS","http://localhost:8080,http://localhost:5173").split(","),allow_credentials=True,allow_methods=["*"],allow_headers=["*"])
 
 def password_hash(password,salt): return hashlib.pbkdf2_hmac("sha256",password.encode(),bytes.fromhex(salt),200_000).hex()
@@ -408,7 +410,7 @@ def health():
     with Session(engine) as s:
         total=s.scalar(select(func.count(Property.id))) if False else None
         workbook_count=len(s.scalars(select(Property.id).where(Property.source=="GTEXT Workbook")).all())
-    return {"ok":True,"version":"4.1.0","refresh_hours":REFRESH_HOURS,"auth_required":AUTH_REQUIRED,"workbook_properties":workbook_count,"providers":{"rentcast":bool(RENTCAST_API_KEY),"offmarket":bool(OFFMARKET_API_URL and OFFMARKET_API_TOKEN)}}
+    return {"ok":True,"version":"4.2.0","refresh_hours":REFRESH_HOURS,"auth_required":AUTH_REQUIRED,"workbook_properties":workbook_count,"providers":{"rentcast":bool(RENTCAST_API_KEY),"offmarket":bool(OFFMARKET_API_URL and OFFMARKET_API_TOKEN),"batchdata":bool(BATCHDATA_API_KEY)}}
 
 @app.post("/auth/register")
 def register(data:RegisterIn):
@@ -692,6 +694,72 @@ GTEXT Acquisition Team"""
     sms_body=f"GTEXT Acquisition Team: We are interested in discussing {p.address}. Subject to due diligence, our current target is about {offer_price:,.0f} USD. Reply only if you are the owner/authorized representative and wish to discuss."
     return subject,email_body,sms_body
 
+def _first_value(obj,*keys,default=""):
+    if not isinstance(obj,dict): return default
+    for key in keys:
+        value=obj.get(key)
+        if value not in (None,"",[],{}): return value
+    return default
+
+def _walk_first_dict(payload):
+    if isinstance(payload,dict):
+        for key in ("result","data","property","owner","match"):
+            value=payload.get(key)
+            if isinstance(value,dict): return value
+            if isinstance(value,list) and value and isinstance(value[0],dict): return value[0]
+        for value in payload.values():
+            if isinstance(value,dict): return value
+            if isinstance(value,list) and value and isinstance(value[0],dict): return value[0]
+        return payload
+    if isinstance(payload,list) and payload and isinstance(payload[0],dict): return payload[0]
+    return {}
+
+def batchdata_post(endpoint,payload):
+    if not BATCHDATA_API_KEY: raise HTTPException(503,"BatchData is not configured")
+    with httpx.Client(timeout=45) as client:
+        r=client.post(
+            f"{BATCHDATA_BASE_URL}{endpoint}",
+            headers={"Authorization":f"Bearer {BATCHDATA_API_KEY}","Accept":"application/json","Content-Type":"application/json"},
+            json=payload
+        )
+        r.raise_for_status()
+        return r.json()
+
+def batchdata_enrich_lead(p):
+    request_item={"propertyAddress":{"street":p.address,"city":p.city,"state":p.state,"zip":p.zip}}
+    lookup_raw=batchdata_post("/property/lookup",{"requests":[request_item]})
+    skip_raw=batchdata_post("/property/skip-trace",{"requests":[request_item]})
+    lookup=_walk_first_dict(lookup_raw); skip=_walk_first_dict(skip_raw)
+
+    owner_name=str(_first_value(skip,"ownerName","owner_name","name",default=_first_value(lookup,"ownerName","owner_name","owner",default="")) or "")
+    owner_email=str(_first_value(skip,"email","primaryEmail","ownerEmail","owner_email",default="") or "")
+    owner_phone=str(_first_value(skip,"mobilePhone","phone","primaryPhone","ownerPhone","owner_phone",default="") or "")
+    mailing_address=str(_first_value(skip,"mailingAddress","ownerMailingAddress","mailing_address",default=_first_value(lookup,"mailingAddress","ownerMailingAddress","mailing_address",default="")) or "")
+    equity_pct=float(_first_value(lookup,"equityPercent","equityPct","estimatedEquityPct","equity_pct",default=0) or 0)
+
+    dnc=bool(_first_value(skip,"dncStatus","dnc","doNotCall",default=False))
+    tcpa_litigator=bool(_first_value(skip,"tcpaLitigator","litigator","tcpa_litigator",default=False))
+    phone_confidence=float(_first_value(skip,"phoneConfidence","confidenceScore","confidence_score",default=0) or 0)
+
+    distress=[]
+    possible_distress={
+        "pre_foreclosure":_first_value(lookup,"preForeclosure","pre_foreclosure",default=False),
+        "tax_delinquent":_first_value(lookup,"taxDelinquent","tax_delinquent",default=False),
+        "vacant":_first_value(lookup,"vacant","vacancy","isVacant",default=False),
+        "absentee_owner":_first_value(lookup,"absenteeOwner","absentee_owner",default=False),
+        "probate":_first_value(lookup,"probate","isProbate",default=False),
+        "liens":_first_value(lookup,"liens","lienCount","lien_count",default=0),
+    }
+    for key,value in possible_distress.items():
+        if value not in (False,None,"",0,[],{}): distress.append({"type":key,"value":value})
+
+    return {
+        "owner_name":owner_name,"owner_email":owner_email,"owner_phone":owner_phone,
+        "mailing_address":mailing_address,"equity_pct":equity_pct,
+        "dnc":dnc,"tcpa_litigator":tcpa_litigator,"phone_confidence":phone_confidence,
+        "distress":distress,"lookup_raw":lookup_raw,"skip_raw":skip_raw
+    }
+
 def bootstrap_acquisition_campaign():
     created={"contacts":0,"offers":0,"outreach":0}
     with Session(engine) as s:
@@ -746,6 +814,61 @@ bootstrap_acquisition_campaign()
 @app.post("/campaign/acquisition/bootstrap")
 def campaign_bootstrap():
     return {"ok":True,**bootstrap_acquisition_campaign()}
+
+@app.post("/campaign/acquisition/enrich-owners")
+def campaign_enrich_owners():
+    if not BATCHDATA_API_KEY: raise HTTPException(503,"BatchData API key is not configured")
+    results=[]; enriched=0; suppressed=0; errors=[]
+    with Session(engine) as s:
+        leads=s.scalars(select(Property).where(Property.lead_status=="active").order_by(Property.id)).all()
+        for p in leads:
+            try:
+                data=batchdata_enrich_lead(p)
+                if data["owner_name"]: p.owner_name=data["owner_name"]
+                if data["owner_email"]: p.owner_email=data["owner_email"]
+                if data["owner_phone"]: p.owner_phone=data["owner_phone"]
+
+                contact=s.scalar(select(Contact).where(Contact.property_id==p.id,Contact.source=="GTEXT acquisition campaign").order_by(Contact.id.desc()))
+                if contact:
+                    if data["owner_name"]: contact.name=data["owner_name"]
+                    if data["owner_email"]: contact.email=data["owner_email"]
+                    if data["owner_phone"]: contact.phone=data["owner_phone"]
+                    contact.status="Attempt Contact" if (data["owner_email"] or data["owner_phone"]) and data["owner_name"] else "Research Owner"
+                    contact.notes=(contact.notes or "")+f"\nBatchData owner enrichment completed. Mailing address: {data['mailing_address'] or 'not returned'}. Phone confidence: {data['phone_confidence']}. DNC: {data['dnc']}. TCPA litigator: {data['tcpa_litigator']}."
+                    contact.updated_at=utcnow()
+
+                for m in s.scalars(select(Outreach).where(Outreach.property_id==p.id)).all():
+                    if m.channel=="email" and data["owner_email"]:
+                        m.recipient=data["owner_email"]
+                        if m.status=="awaiting-contact-data": m.status="draft"
+                    if m.channel=="sms" and data["owner_phone"]:
+                        m.recipient=data["owner_phone"]
+                        if m.status=="awaiting-contact-data": m.status="draft"
+                    if data["dnc"] or data["tcpa_litigator"]:
+                        m.suppressed=True; m.status="suppressed"
+                        suppressed+=1
+
+                s.add(Distress(
+                    property_id=p.id,provider="BatchData",record_type="owner-enrichment",severity=1,
+                    amount=0,owner_name=data["owner_name"],owner_email=data["owner_email"],owner_phone=data["owner_phone"],
+                    mailing_address=data["mailing_address"],estimated_equity_pct=data["equity_pct"],
+                    source_url="",verified_at=utcnow(),
+                    raw_payload={"lookup":data["lookup_raw"],"skip_trace":data["skip_raw"]}
+                ))
+                for signal in data["distress"]:
+                    s.add(Distress(
+                        property_id=p.id,provider="BatchData",record_type=signal["type"],severity=2,
+                        amount=float(signal["value"]) if isinstance(signal["value"],(int,float)) else 0,
+                        owner_name=data["owner_name"],owner_email=data["owner_email"],owner_phone=data["owner_phone"],
+                        mailing_address=data["mailing_address"],estimated_equity_pct=data["equity_pct"],
+                        source_url="",verified_at=utcnow(),raw_payload=signal
+                    ))
+                enriched+=1
+                results.append({"property_id":p.id,"owner_found":bool(data["owner_name"]),"email_found":bool(data["owner_email"]),"phone_found":bool(data["owner_phone"]),"dnc":data["dnc"],"tcpa_litigator":data["tcpa_litigator"],"distress_signals":[x["type"] for x in data["distress"]]})
+            except Exception as e:
+                errors.append({"property_id":p.id,"error":str(e)[:240]})
+        s.commit()
+    return {"provider":"BatchData","processed":len(leads),"enriched":enriched,"suppressed_messages":suppressed,"errors":errors,"results":results}
 
 @app.get("/campaign/acquisition")
 def campaign_acquisition():
@@ -968,7 +1091,8 @@ def providers():
     return [
         {"id":"rentcast","name":"RentCast","enabled":bool(RENTCAST_API_KEY)},
         {"id":"offmarket","name":"Distressed seller feed","enabled":bool(OFFMARKET_API_URL and OFFMARKET_API_TOKEN)},
-        {"id":"openai","name":"OpenAI property memos","enabled":bool(OPENAI_API_KEY)}
+        {"id":"openai","name":"OpenAI property memos","enabled":bool(OPENAI_API_KEY)},
+        {"id":"batchdata","name":"BatchData owner/contact enrichment","enabled":bool(BATCHDATA_API_KEY)}
     ]
 
 @app.post("/auth/logout")
