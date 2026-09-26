@@ -314,7 +314,11 @@ def seed():
 seed()
 
 @app.get("/health")
-def health(): return {"ok":True,"version":"3.1.0","refresh_hours":REFRESH_HOURS,"auth_required":AUTH_REQUIRED,"providers":{"rentcast":bool(RENTCAST_API_KEY),"offmarket":bool(OFFMARKET_API_URL and OFFMARKET_API_TOKEN)}}
+def health():
+    with Session(engine) as s:
+        total=s.scalar(select(func.count(Property.id))) if False else None
+        workbook_count=len(s.scalars(select(Property.id).where(Property.source=="GTEXT Workbook")).all())
+    return {"ok":True,"version":"3.1.0","refresh_hours":REFRESH_HOURS,"auth_required":AUTH_REQUIRED,"workbook_properties":workbook_count,"providers":{"rentcast":bool(RENTCAST_API_KEY),"offmarket":bool(OFFMARKET_API_URL and OFFMARKET_API_TOKEN)}}
 
 @app.post("/auth/register")
 def register(data:RegisterIn):
