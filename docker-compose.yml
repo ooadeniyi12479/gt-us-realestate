@@ -35,6 +35,8 @@ services:
       TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
       TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
       TWILIO_FROM: ${TWILIO_FROM:-}
+      BATCHDATA_API_KEY: ${BATCHDATA_API_KEY:-}
+      BATCHDATA_BASE_URL: ${BATCHDATA_BASE_URL:-https://api.batchdata.com/api/v1}
     depends_on:
       db:
         condition: service_healthy

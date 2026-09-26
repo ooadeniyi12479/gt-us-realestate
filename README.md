@@ -16,7 +16,7 @@ GTEXT is a full-stack real-estate lead intelligence application for finding, mon
 ### Live property feed
 The first production connector is **RentCast**. Add `RENTCAST_API_KEY` and the scheduled ingestion job will query the target cities/states defined in the Buy Box. The connector normalizes provider data into the GTEXT property model.
 
-The provider layer is intentionally isolated so MLS/RESO, ATTOM, BatchData or another licensed/off-market source can be added without redesigning the UI or underwriting model.
+The provider layer is intentionally isolated so MLS/RESO, ATTOM or another licensed/off-market source can be added without redesigning the UI or underwriting model. **BatchData is implemented** for owner lookup and skip-trace on acquisition campaign leads (`POST /campaign/acquisition/enrich-owners`).
 
 ### Availability tracking
 - Automatic refresh every 6 hours by default (`REFRESH_HOURS=6`)
@@ -121,6 +121,8 @@ SMTP_PORT=587
 SMTP_USER=alerts@example.com
 SMTP_PASSWORD=your_password
 SMTP_FROM=alerts@example.com
+BATCHDATA_API_KEY=your_batchdata_key
+BATCHDATA_BASE_URL=https://api.batchdata.com/api/v1
 ```
 
 4. Start the stack:
@@ -163,6 +165,23 @@ Change the target cities and underwriting thresholds in the UI, then save. The n
 RentCast is used for the implemented live adapter because the API exposes sale listings, property records and sold-property queries. A provider API key is required. GTEXT does not scrape consumer listing websites.
 
 Off-market investor datasets often require a separate licensed source. The existing GTEXT model can ingest those records as `market_type=off-market`; the next connector can map absentee-owner, high-equity, pre-foreclosure, tax-delinquency, probate or other licensed signals into `distress_signals`.
+
+### BatchData owner enrichment
+
+Acquisition campaign leads can be enriched with licensed owner and skip-trace data from BatchData. Add the following to `.env` (placeholders only — never commit a real key):
+
+```env
+BATCHDATA_API_KEY=your_batchdata_key
+BATCHDATA_BASE_URL=https://api.batchdata.com/api/v1
+```
+
+`docker compose` passes both variables into the `api` container. With a key present:
+
+- `GET /providers` reports BatchData `enabled: true`
+- `GET /health` includes `providers.batchdata`
+- `POST /campaign/acquisition/enrich-owners` runs property lookup plus skip-trace for every `lead_status=active` campaign lead
+
+When BatchData returns a DNC or TCPA-litigator flag, related outreach drafts are marked `suppressed`. Delivery still requires `consent_confirmed=true` and a configured SMTP or Twilio provider. Use only licensed data and confirm you have permission to contact a person before sending.
 
 ## Security and production notes
 

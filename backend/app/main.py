@@ -569,7 +569,10 @@ def comps(property_id:str,radius:float=Query(3,ge=.5,le=20),days:int=Query(180,g
         if not rows:
             rows=[{"address":f"Nearby comp {i+1}","sale_price":round(p.estimated_arv*(.94+i*.03),2),"sale_date":(utcnow()-timedelta(days=45+i*30)).date().isoformat(),"sqft":max(p.sqft+(-100+i*80),500),"price_per_sqft":round((p.estimated_arv*(.94+i*.03))/max(p.sqft+(-100+i*80),500),2)} for i in range(3)]
         prices=[r["sale_price"] for r in rows]; ppsf=[r["price_per_sqft"] for r in rows if r["price_per_sqft"]]
-        return {"property_id":property_id,"count":len(rows),"average_sale_price":round(sum(prices)/len(prices),2),"average_price_per_sqft":round(sum(ppsf)/len(ppsf),2) if ppsf else 0,"comps":rows}
+        ordered=sorted(prices)
+        mid=len(ordered)//2
+        median=ordered[mid] if len(ordered)%2 else round((ordered[mid-1]+ordered[mid])/2,2) if ordered else 0
+        return {"property_id":property_id,"count":len(rows),"average_sale_price":round(sum(prices)/len(prices),2),"median_sale_price":median,"average_price_per_sqft":round(sum(ppsf)/len(ppsf),2) if ppsf else 0,"comps":rows}
 
 @app.post("/properties/{property_id}/memo")
 def memo(property_id:str):
@@ -1141,4 +1144,3 @@ def evaluate_alerts():
                 s.add(AlertEvent(rule_id=rule.id,property_id=p.id,message=msg,delivered=delivered)); created+=1
         s.commit()
     return {"created":created}
-
