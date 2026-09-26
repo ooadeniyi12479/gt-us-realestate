@@ -381,6 +381,33 @@ def save_property(property_id:str):
         if not p: raise HTTPException(404,"Property not found")
         p.saved=not p.saved; s.commit(); return {"saved":p.saved}
 
+@app.post("/properties/import")
+def import_properties(rows:list[dict]):
+    allowed={"id","provider_id","address","city","state","zip","property_type","beds","baths","sqft","year_built","asking_price","estimated_arv","estimated_rehab","estimated_rent","taxes_annual","source","market_type","status","days_on_market","latitude","longitude","distress_signals","agent_name","agent_email","agent_phone","owner_name","owner_email","owner_phone","saved","notes"}
+    inserted=0; updated=0; errors=[]; now=utcnow()
+    with Session(engine) as s:
+        for i,row in enumerate(rows):
+            try:
+                data={k:v for k,v in row.items() if k in allowed}
+                pid=str(data.get("id") or "").strip()
+                if not pid or not data.get("address"):
+                    raise ValueError("id and address are required")
+                data["id"]=pid
+                p=s.get(Property,pid)
+                if p:
+                    old=p.status
+                    for k,v in data.items():
+                        if k!="id": setattr(p,k,v)
+                    p.last_seen=now; updated+=1
+                    if old!=p.status: s.add(StatusEvent(property_id=p.id,status=p.status,source=p.source,observed_at=now))
+                else:
+                    p=Property(**data,first_seen=now,last_seen=now)
+                    s.add(p); s.add(StatusEvent(property_id=p.id,status=p.status,source=p.source,observed_at=now)); inserted+=1
+            except Exception as e:
+                errors.append({"row":i+1,"error":str(e)})
+        s.commit()
+    return {"inserted":inserted,"updated":updated,"errors":errors,"total":inserted+updated}
+
 def rentcast_get(path,params):
     if not RENTCAST_API_KEY: return []
     with httpx.Client(timeout=30) as c:
