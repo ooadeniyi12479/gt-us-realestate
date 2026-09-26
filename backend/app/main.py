@@ -20,6 +20,8 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 DATABASE_URL=os.getenv("DATABASE_URL","sqlite:///./gtext.db")
 RENTCAST_API_KEY=os.getenv("RENTCAST_API_KEY","")
 RENTCAST_BASE_URL=os.getenv("RENTCAST_BASE_URL","https://api.rentcast.io/v1")
+OPENAI_API_KEY=os.getenv("OPENAI_API_KEY","")
+OPENAI_MODEL=os.getenv("OPENAI_MODEL","gpt-5.6-luna")
 REFRESH_HOURS=int(os.getenv("REFRESH_HOURS","6"))
 STALE_HOURS=int(os.getenv("STALE_HOURS","18"))
 AUTH_REQUIRED=os.getenv("AUTH_REQUIRED","true").lower()=="true"
@@ -451,7 +453,7 @@ def memo(property_id:str):
         p=s.get(Property,property_id)
         if not p: raise HTTPException(404,"Property not found")
         a=analysis(p,cfg(s))
-        text=f"""DEAL SNAPSHOT
+        fallback=f"""DEAL SNAPSHOT
 {p.address}, {p.city}, {p.state} {p.zip}
 Asking: {p.asking_price:,.0f} USD | ARV: {p.estimated_arv:,.0f} USD | Rehab: {p.estimated_rehab:,.0f} USD
 Deal score: {a['score']}/100 | MAO: {a['mao']:,.0f} USD
@@ -464,7 +466,26 @@ RISKS
 
 NEXT DILIGENCE
 Verify title and liens, property condition, repair scope, taxes and HOA, insurance, zoning, rents, sold comps and current seller/listing status before making a binding offer."""
-        return {"property_id":property_id,"model":"rules","content":text}
+        if not OPENAI_API_KEY:
+            return {"property_id":property_id,"model":"rules","content":fallback}
+        prompt=("Act as a disciplined U.S. real-estate acquisition analyst. Produce a concise investment memo with sections: Deal Snapshot, "
+                "Market and Comps, Strategy Fit, Risks, Negotiation Angle, and Next Due-Diligence Steps. Do not invent facts. "
+                f"Property: {p.address}, {p.city}, {p.state} {p.zip}; asking {p.asking_price}; ARV {p.estimated_arv}; rehab {p.estimated_rehab}; "
+                f"rent {p.estimated_rent}; score {a['score']}; MAO {a['mao']}; strategies {a['strategies']}; risks {a['risks']}.")
+        try:
+            with httpx.Client(timeout=45) as client:
+                r=client.post("https://api.openai.com/v1/responses",headers={"Authorization":f"Bearer {OPENAI_API_KEY}","Content-Type":"application/json"},json={"model":OPENAI_MODEL,"input":prompt})
+                r.raise_for_status(); payload=r.json()
+            text=payload.get("output_text")
+            if not text:
+                parts=[]
+                for item in payload.get("output",[]):
+                    for part in item.get("content",[]):
+                        if part.get("type")=="output_text" and part.get("text"): parts.append(part["text"])
+                text="\n".join(parts)
+            return {"property_id":property_id,"model":OPENAI_MODEL,"content":text or fallback}
+        except Exception:
+            return {"property_id":property_id,"model":"rules-fallback","content":fallback}
 
 @app.get("/distress/{property_id}")
 def distress_records(property_id:str):
@@ -661,3 +682,99 @@ def scheduled_refresh():
 scheduler=BackgroundScheduler(timezone="UTC")
 scheduler.add_job(scheduled_refresh,"interval",hours=REFRESH_HOURS,id="property-refresh",replace_existing=True,max_instances=1)
 scheduler.start()
+
+
+class AlertRule(Base):
+    __tablename__="alert_rules"
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    name:Mapped[str]=mapped_column(String)
+    email:Mapped[str]=mapped_column(String,default="")
+    min_score:Mapped[int]=mapped_column(Integer,default=75)
+    max_price:Mapped[float]=mapped_column(Float,default=1000000)
+    city:Mapped[str]=mapped_column(String,default="")
+    strategy:Mapped[str]=mapped_column(String,default="")
+    enabled:Mapped[bool]=mapped_column(Boolean,default=True)
+    created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=utcnow)
+
+class AlertEvent(Base):
+    __tablename__="alert_events"
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    rule_id:Mapped[int]=mapped_column(Integer,index=True)
+    property_id:Mapped[str]=mapped_column(String,index=True)
+    message:Mapped[str]=mapped_column(Text)
+    delivered:Mapped[bool]=mapped_column(Boolean,default=False)
+    created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=utcnow)
+
+Base.metadata.create_all(engine)
+
+class AlertIn(BaseModel):
+    name:str
+    email:str=""
+    min_score:int=75
+    max_price:float=1000000
+    city:str=""
+    strategy:str=""
+    enabled:bool=True
+
+@app.get("/dashboard")
+def dashboard():
+    with Session(engine) as s:
+        c=cfg(s); rows=s.scalars(select(Property)).all()
+        active=[p for p in rows if p.status=="active"]
+        return {"active":len(active),"qualified":sum(1 for p in active if analysis(p,c)["qualified"]),"off_market":sum(1 for p in active if p.market_type=="off-market"),"saved":sum(1 for p in rows if p.saved)}
+
+@app.get("/providers")
+def providers():
+    return [
+        {"id":"rentcast","name":"RentCast","enabled":bool(RENTCAST_API_KEY)},
+        {"id":"offmarket","name":"Distressed seller feed","enabled":bool(OFFMARKET_API_URL and OFFMARKET_API_TOKEN)},
+        {"id":"openai","name":"OpenAI property memos","enabled":bool(OPENAI_API_KEY)}
+    ]
+
+@app.post("/auth/logout")
+def logout(request:Request):
+    header=request.headers.get("Authorization","")
+    value=header[7:] if header.startswith("Bearer ") else ""
+    if value:
+        with Session(engine) as s:
+            t=s.get(Token,value)
+            if t: s.delete(t); s.commit()
+    return {"ok":True}
+
+@app.post("/alerts/rules")
+def create_alert(data:AlertIn):
+    with Session(engine) as s:
+        r=AlertRule(**data.model_dump()); s.add(r); s.commit(); s.refresh(r)
+        return {"id":r.id,"ok":True}
+
+@app.get("/alerts/rules")
+def list_alerts():
+    with Session(engine) as s:
+        rows=s.scalars(select(AlertRule).order_by(AlertRule.created_at.desc())).all()
+        return [{"id":r.id,"name":r.name,"email":r.email,"min_score":r.min_score,"max_price":r.max_price,"city":r.city,"strategy":r.strategy,"enabled":r.enabled} for r in rows]
+
+@app.get("/alerts/events")
+def alert_events():
+    with Session(engine) as s:
+        rows=s.scalars(select(AlertEvent).order_by(AlertEvent.created_at.desc()).limit(100)).all()
+        return [{"id":r.id,"rule_id":r.rule_id,"property_id":r.property_id,"message":r.message,"delivered":r.delivered,"created_at":r.created_at.isoformat()} for r in rows]
+
+@app.post("/alerts/evaluate")
+def evaluate_alerts():
+    created=0
+    with Session(engine) as s:
+        c=cfg(s); rules=s.scalars(select(AlertRule).where(AlertRule.enabled==True)).all(); props=s.scalars(select(Property).where(Property.status=="active")).all()
+        for rule in rules:
+            for p in props:
+                a=analysis(p,c)
+                if a["score"]<rule.min_score or p.asking_price>rule.max_price: continue
+                if rule.city and p.city.lower()!=rule.city.lower(): continue
+                if rule.strategy and rule.strategy not in a["strategies"]: continue
+                existing=s.scalar(select(AlertEvent.id).where(AlertEvent.rule_id==rule.id,AlertEvent.property_id==p.id))
+                if existing: continue
+                msg=f"{p.address}, {p.city}, {p.state} scored {a['score']}/100 at {p.asking_price:,.0f} USD; MAO {a['mao']:,.0f} USD."
+                delivered=send_email(rule.email,"GTEXT qualifying property lead",msg) if rule.email else False
+                s.add(AlertEvent(rule_id=rule.id,property_id=p.id,message=msg,delivered=delivered)); created+=1
+        s.commit()
+    return {"created":created}
+
