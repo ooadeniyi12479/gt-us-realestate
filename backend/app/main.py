@@ -14,7 +14,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from sqlalchemy import Boolean, DateTime, Float, Integer, JSON, String, Text, create_engine, select
+from sqlalchemy import Boolean, DateTime, Float, Integer, JSON, String, Text, create_engine, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
 DATABASE_URL=os.getenv("DATABASE_URL","sqlite:///./gtext.db")
@@ -63,7 +63,13 @@ class Property(Base):
     taxes_annual:Mapped[float]=mapped_column(Float,default=0)
     source:Mapped[str]=mapped_column(String,default="manual")
     market_type:Mapped[str]=mapped_column(String,default="on-market")
-    status:Mapped[str]=mapped_column(String,default="active",index=True)
+    status:Mapped[str]=mapped_column(String,default="active",index=True)  # legacy listing-status alias
+    listing_status:Mapped[str]=mapped_column(String,default="active",index=True)
+    lead_status:Mapped[str]=mapped_column(String,default="new",index=True)
+    pipeline_stage:Mapped[str]=mapped_column(String,default="unclassified",index=True)
+    offer_low:Mapped[float]=mapped_column(Float,default=0)
+    offer_target:Mapped[float]=mapped_column(Float,default=0)
+    offer_high:Mapped[float]=mapped_column(Float,default=0)
     days_on_market:Mapped[int]=mapped_column(Integer,default=0)
     latitude:Mapped[Optional[float]]=mapped_column(Float,nullable=True)
     longitude:Mapped[Optional[float]]=mapped_column(Float,nullable=True)
@@ -203,6 +209,25 @@ class DealRoom(Base):
 
 Base.metadata.create_all(engine)
 
+def migrate_property_pipeline_schema():
+    # create_all does not add columns to an existing table, so add the V4 fields idempotently.
+    statements=[
+        "ALTER TABLE properties ADD COLUMN IF NOT EXISTS listing_status VARCHAR DEFAULT 'active'",
+        "ALTER TABLE properties ADD COLUMN IF NOT EXISTS lead_status VARCHAR DEFAULT 'new'",
+        "ALTER TABLE properties ADD COLUMN IF NOT EXISTS pipeline_stage VARCHAR DEFAULT 'unclassified'",
+        "ALTER TABLE properties ADD COLUMN IF NOT EXISTS offer_low FLOAT DEFAULT 0",
+        "ALTER TABLE properties ADD COLUMN IF NOT EXISTS offer_target FLOAT DEFAULT 0",
+        "ALTER TABLE properties ADD COLUMN IF NOT EXISTS offer_high FLOAT DEFAULT 0",
+    ]
+    with engine.begin() as conn:
+        for statement in statements:
+            conn.execute(text(statement))
+        conn.execute(text("UPDATE properties SET listing_status=status WHERE listing_status IS NULL OR listing_status=''"))
+        conn.execute(text("UPDATE properties SET lead_status='new' WHERE lead_status IS NULL OR lead_status=''"))
+        conn.execute(text("UPDATE properties SET pipeline_stage='unclassified' WHERE pipeline_stage IS NULL OR pipeline_stage=''"))
+
+migrate_property_pipeline_schema()
+
 class RegisterIn(BaseModel):
     email:str; name:str; password:str=Field(min_length=8); company:str=""
 
@@ -244,7 +269,7 @@ class DealRoomIn(BaseModel):
     projected_value:float=0; invested_capital:float=0; target_close:Optional[datetime]=None
     checklist:list=[]; documents:list=[]; notes:str=""
 
-app=FastAPI(title="GTEXT Real Estate Assistant API",version="3.1.0")
+app=FastAPI(title="GTEXT Real Estate Assistant API",version="4.0.0")
 app.add_middleware(CORSMiddleware,allow_origins=os.getenv("CORS_ORIGINS","http://localhost:8080,http://localhost:5173").split(","),allow_credentials=True,allow_methods=["*"],allow_headers=["*"])
 
 def password_hash(password,salt): return hashlib.pbkdf2_hmac("sha256",password.encode(),bytes.fromhex(salt),200_000).hex()
@@ -285,7 +310,8 @@ def analysis(p,c):
     gy=p.estimated_rent*12/p.asking_price*100 if p.asking_price else 0
     spread=mao-p.asking_price
     disc=(p.estimated_arv-p.asking_price)/p.estimated_arv*100 if p.estimated_arv else 0
-    score=50+min(22,max(-22,disc*.85))+(12 if roi>=c.min_flip_roi else -5)+(8 if gy>=c.min_gross_yield else 0)+(6 if p.market_type=="off-market" else 0)+(4 if p.days_on_market>=45 else 0)-(18 if p.status!="active" else 0)
+    listing_status=p.listing_status or p.status
+    score=50+min(22,max(-22,disc*.85))+(12 if roi>=c.min_flip_roi else -5)+(8 if gy>=c.min_gross_yield else 0)+(6 if p.market_type=="off-market" else 0)+(4 if p.days_on_market>=45 else 0)-(18 if listing_status!="active" else 0)
     strategies=[]
     if profit>=c.min_flip_profit and roi>=c.min_flip_roi: strategies.append("Fix & Flip")
     if gy>=c.min_gross_yield: strategies.append("Buy & Hold")
@@ -293,10 +319,10 @@ def analysis(p,c):
     risks=list(p.distress_signals or [])
     if p.asking_price and p.asking_price>mao: risks.append("Asking price exceeds configured MAO")
     score=round(max(0,min(100,score)))
-    return {"mao":round(mao,2),"flip_profit":round(profit,2),"roi":round(roi,1),"gross_yield":round(gy,1),"wholesale_spread":round(spread,2),"score":score,"strategies":strategies or ["Further Analysis"],"risks":risks,"qualified":p.status=="active" and score>=c.min_deal_score and p.asking_price<=c.max_price}
+    return {"mao":round(mao,2),"flip_profit":round(profit,2),"roi":round(roi,1),"gross_yield":round(gy,1),"wholesale_spread":round(spread,2),"score":score,"strategies":strategies or ["Further Analysis"],"risks":risks,"qualified":p.lead_status=="active" and score>=c.min_deal_score and p.asking_price<=c.max_price}
 
 def prop_json(p,c):
-    return {"id":p.id,"address":p.address,"city":p.city,"state":p.state,"zip":p.zip,"property_type":p.property_type,"beds":p.beds,"baths":p.baths,"sqft":p.sqft,"year_built":p.year_built,"asking_price":p.asking_price,"estimated_arv":p.estimated_arv,"estimated_rehab":p.estimated_rehab,"estimated_rent":p.estimated_rent,"taxes_annual":p.taxes_annual,"source":p.source,"market_type":p.market_type,"status":p.status,"days_on_market":p.days_on_market,"latitude":p.latitude,"longitude":p.longitude,"distress_signals":p.distress_signals or [],"agent_name":p.agent_name,"agent_email":p.agent_email,"agent_phone":p.agent_phone,"owner_name":p.owner_name,"owner_email":p.owner_email,"owner_phone":p.owner_phone,"last_seen":p.last_seen.isoformat(),"first_seen":p.first_seen.isoformat(),"saved":p.saved,"notes":p.notes,"analysis":analysis(p,c)}
+    return {"id":p.id,"address":p.address,"city":p.city,"state":p.state,"zip":p.zip,"property_type":p.property_type,"beds":p.beds,"baths":p.baths,"sqft":p.sqft,"year_built":p.year_built,"asking_price":p.asking_price,"estimated_arv":p.estimated_arv,"estimated_rehab":p.estimated_rehab,"estimated_rent":p.estimated_rent,"taxes_annual":p.taxes_annual,"source":p.source,"market_type":p.market_type,"status":p.status,"listing_status":p.listing_status or p.status,"lead_status":p.lead_status,"pipeline_stage":p.pipeline_stage,"offer_range":{"low":p.offer_low,"target":p.offer_target,"high":p.offer_high},"days_on_market":p.days_on_market,"latitude":p.latitude,"longitude":p.longitude,"distress_signals":p.distress_signals or [],"agent_name":p.agent_name,"agent_email":p.agent_email,"agent_phone":p.agent_phone,"owner_name":p.owner_name,"owner_email":p.owner_email,"owner_phone":p.owner_phone,"last_seen":p.last_seen.isoformat(),"first_seen":p.first_seen.isoformat(),"saved":p.saved,"notes":p.notes,"analysis":analysis(p,c)}
 
 def seed():
     with Session(engine) as s:
@@ -334,12 +360,50 @@ def seed_workbook_properties():
 
 seed_workbook_properties()
 
+def offer_range_from_mao(p,c):
+    mao=max(0,p.estimated_arv*c.mao_percent-p.estimated_rehab)
+    return round(mao*.90,2),round(mao*.95,2),round(mao,2)
+
+def classify_acquisition_pipeline():
+    target_ids={"workbook:P02","workbook:P05","workbook:P10","workbook:P12","workbook:P18"}
+    with Session(engine) as s:
+        c=cfg(s)
+        for p in s.scalars(select(Property).where(Property.source=="GTEXT Workbook")).all():
+            p.listing_status=p.status
+            if p.id in target_ids and p.status=="off-market":
+                low,target,high=offer_range_from_mao(p,c)
+                p.lead_status="active"
+                p.pipeline_stage="owner-contact"
+                p.offer_low=low; p.offer_target=target; p.offer_high=high
+            elif p.status=="sold":
+                p.lead_status="closed"
+                p.pipeline_stage="not-actionable"
+                p.offer_low=p.offer_target=p.offer_high=0
+            elif p.status=="pending":
+                p.lead_status="monitor"
+                p.pipeline_stage="pending-watch"
+                p.offer_low=p.offer_target=p.offer_high=0
+            else:
+                p.lead_status="monitor"
+                p.pipeline_stage="listing-review"
+                p.offer_low=p.offer_target=p.offer_high=0
+        s.commit()
+
+classify_acquisition_pipeline()
+
+@app.get("/pipeline/acquisition-validation")
+def acquisition_validation_pipeline():
+    with Session(engine) as s:
+        c=cfg(s)
+        rows=s.scalars(select(Property).where(Property.lead_status=="active").order_by(Property.id)).all()
+        return [prop_json(p,c) for p in rows]
+
 @app.get("/health")
 def health():
     with Session(engine) as s:
         total=s.scalar(select(func.count(Property.id))) if False else None
         workbook_count=len(s.scalars(select(Property.id).where(Property.source=="GTEXT Workbook")).all())
-    return {"ok":True,"version":"3.1.0","refresh_hours":REFRESH_HOURS,"auth_required":AUTH_REQUIRED,"workbook_properties":workbook_count,"providers":{"rentcast":bool(RENTCAST_API_KEY),"offmarket":bool(OFFMARKET_API_URL and OFFMARKET_API_TOKEN)}}
+    return {"ok":True,"version":"4.0.0","refresh_hours":REFRESH_HOURS,"auth_required":AUTH_REQUIRED,"workbook_properties":workbook_count,"providers":{"rentcast":bool(RENTCAST_API_KEY),"offmarket":bool(OFFMARKET_API_URL and OFFMARKET_API_TOKEN)}}
 
 @app.post("/auth/register")
 def register(data:RegisterIn):
@@ -376,13 +440,14 @@ def put_buy_box(data:BuyBoxIn):
         s.commit(); return {"ok":True}
 
 @app.get("/properties")
-def properties(q:str="",market_type:str="all",status:str="active",min_score:int=0):
+def properties(q:str="",market_type:str="all",status:str="active",lead_status:str="all",min_score:int=0):
     with Session(engine) as s:
         c=cfg(s); out=[]
         for p in s.scalars(select(Property)).all():
             if q and q.lower() not in f"{p.address} {p.city} {p.state} {p.zip}".lower(): continue
             if market_type!="all" and p.market_type!=market_type: continue
-            if status!="all" and p.status!=status: continue
+            if status!="all" and (p.listing_status or p.status)!=status: continue
+            if lead_status!="all" and p.lead_status!=lead_status: continue
             item=prop_json(p,c)
             if item["analysis"]["score"]>=min_score: out.append(item)
         return sorted(out,key=lambda x:x["analysis"]["score"],reverse=True)
@@ -408,7 +473,7 @@ def save_property(property_id:str):
 
 @app.post("/properties/import")
 def import_properties(rows:list[dict]):
-    allowed={"id","provider_id","address","city","state","zip","property_type","beds","baths","sqft","year_built","asking_price","estimated_arv","estimated_rehab","estimated_rent","taxes_annual","source","market_type","status","days_on_market","latitude","longitude","distress_signals","agent_name","agent_email","agent_phone","owner_name","owner_email","owner_phone","saved","notes"}
+    allowed={"id","provider_id","address","city","state","zip","property_type","beds","baths","sqft","year_built","asking_price","estimated_arv","estimated_rehab","estimated_rent","taxes_annual","source","market_type","status","listing_status","lead_status","pipeline_stage","offer_low","offer_target","offer_high","days_on_market","latitude","longitude","distress_signals","agent_name","agent_email","agent_phone","owner_name","owner_email","owner_phone","saved","notes"}
     inserted=0; updated=0; errors=[]; now=utcnow()
     with Session(engine) as s:
         for i,row in enumerate(rows):
@@ -441,7 +506,7 @@ def rentcast_get(path,params):
 def normalize_listing(x):
     pid=str(x.get("id") or x.get("mlsNumber") or x.get("formattedAddress") or secrets.token_hex(8)); price=float(x.get("price") or x.get("listedPrice") or 0)
     raw=str(x.get("status") or "active").lower().replace(" ","-"); status="active" if raw in {"active","for-sale","forsale"} else raw
-    return dict(id=f"rentcast:{pid}",provider_id=pid,address=x.get("addressLine1") or x.get("formattedAddress") or "Unknown address",city=x.get("city") or "",state=x.get("state") or "",zip=str(x.get("zipCode") or ""),property_type=x.get("propertyType") or "Residential",beds=int(x.get("bedrooms") or 0),baths=float(x.get("bathrooms") or 0),sqft=int(x.get("squareFootage") or 0),year_built=int(x.get("yearBuilt") or 0),asking_price=price,estimated_arv=float(x.get("estimatedValue") or price),estimated_rehab=0,estimated_rent=float(x.get("estimatedRent") or 0),taxes_annual=float(x.get("propertyTaxes") or 0),source="RentCast",market_type="on-market",status=status,days_on_market=int(x.get("daysOnMarket") or 0),latitude=x.get("latitude"),longitude=x.get("longitude"),distress_signals=[])
+    return dict(id=f"rentcast:{pid}",provider_id=pid,address=x.get("addressLine1") or x.get("formattedAddress") or "Unknown address",city=x.get("city") or "",state=x.get("state") or "",zip=str(x.get("zipCode") or ""),property_type=x.get("propertyType") or "Residential",beds=int(x.get("bedrooms") or 0),baths=float(x.get("bathrooms") or 0),sqft=int(x.get("squareFootage") or 0),year_built=int(x.get("yearBuilt") or 0),asking_price=price,estimated_arv=float(x.get("estimatedValue") or price),estimated_rehab=0,estimated_rent=float(x.get("estimatedRent") or 0),taxes_annual=float(x.get("propertyTaxes") or 0),source="RentCast",market_type="on-market",status=status,listing_status=status,lead_status="new",pipeline_stage="listing-review",days_on_market=int(x.get("daysOnMarket") or 0),latitude=x.get("latitude"),longitude=x.get("longitude"),distress_signals=[])
 
 def refresh_live_feeds():
     result={"enabled":bool(RENTCAST_API_KEY),"fetched":0,"inserted":0,"updated":0,"stale_reconciled":0,"errors":[]}
@@ -468,7 +533,7 @@ def refresh_live_feeds():
             for p in s.scalars(select(Property).where(Property.source=="RentCast",Property.status=="active")).all():
                 seen=p.last_seen if p.last_seen.tzinfo else p.last_seen.replace(tzinfo=timezone.utc)
                 if seen<cutoff:
-                    p.status="unconfirmed-off-market"; s.add(StatusEvent(property_id=p.id,status=p.status,source=p.source,observed_at=now)); result["stale_reconciled"]+=1
+                    p.status="unconfirmed-off-market"; p.listing_status="unconfirmed-off-market"; s.add(StatusEvent(property_id=p.id,status=p.status,source=p.source,observed_at=now)); result["stale_reconciled"]+=1
         s.commit()
     return result
 
